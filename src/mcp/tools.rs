@@ -47,6 +47,23 @@ fn internal(reason: impl Into<String>) -> McpError {
     McpError::internal_error(reason.into(), None)
 }
 
+/// A failure the caller can read and act on (unknown chat or account, a
+/// locked chat, a failed archive read). MCP wants these as tool results with
+/// `isError` set, not as protocol errors, so a model sees the words.
+fn failure(reason: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(reason.into())])
+}
+
+/// Leaves the tool with a failure result when a step answered one.
+macro_rules! step {
+    ($step:expr) => {
+        match $step {
+            Ok(value) => value,
+            Err(reply) => return Ok(reply),
+        }
+    };
+}
+
 /// The MCP server proper. One instance per client session; all of them share
 /// the one hub, whose archive readers and command senders outlive sessions.
 #[derive(Clone)]
@@ -65,16 +82,20 @@ impl ZapServer {
     }
 
     /// Resolves the tool call's `account_id`, or the first linked account.
-    fn resolve(&self, account: Option<&str>) -> Result<Arc<super::AccountEntry>, McpError> {
+    fn resolve(&self, account: Option<&str>) -> Result<Arc<super::AccountEntry>, CallToolResult> {
         self.hub
             .entry(account)
             .map(|(_, entry)| entry)
-            .map_err(internal)
+            .map_err(failure)
     }
 
     /// Runs one archive read on the blocking pool, so the server loop never
     /// waits on SQLite.
-    async fn read_on<R, F>(&self, entry: &Arc<super::AccountEntry>, read: F) -> Result<R, McpError>
+    async fn read_on<R, F>(
+        &self,
+        entry: &Arc<super::AccountEntry>,
+        read: F,
+    ) -> Result<R, CallToolResult>
     where
         R: Send + 'static,
         F: Fn(&Archive) -> Result<R, super::ReadError> + Send + 'static,
@@ -82,8 +103,8 @@ impl ZapServer {
         let entry = entry.clone();
         tokio::task::spawn_blocking(move || entry.with_archive(read))
             .await
-            .map_err(|error| internal(format!("archive read task failed: {error}")))?
-            .map_err(internal)
+            .map_err(|error| failure(format!("archive read task failed: {error}")))?
+            .map_err(failure)
     }
 
     fn json_reply(value: serde_json::Value) -> Result<CallToolResult, McpError> {
@@ -134,9 +155,9 @@ impl ZapServer {
         let filter = args.filter.clone();
         let include_archived = args.include_archived.unwrap_or(false);
         let include_locked = args.include_locked.unwrap_or(false);
-        let entry = self.resolve(args.account_id.as_deref())?;
-        let chats = self
-            .read_on(&entry, move |archive| {
+        let entry = step!(self.resolve(args.account_id.as_deref()));
+        let chats = step!(
+            self.read_on(&entry, move |archive| {
                 Ok(dto::collect_chats(
                     archive.chats()?,
                     filter.as_deref(),
@@ -145,7 +166,8 @@ impl ZapServer {
                     limit,
                 ))
             })
-            .await?;
+            .await
+        );
         let response = dto::ChatsResponse { chats };
         Self::json_reply(
             serde_json::to_value(response).map_err(|error| internal(error.to_string()))?,
@@ -164,14 +186,15 @@ impl ZapServer {
             .before
             .clone()
             .map(|cursor| (cursor.timestamp, cursor.id));
-        let entry = self.resolve(args.account_id.as_deref())?;
+        let entry = step!(self.resolve(args.account_id.as_deref()));
         let chat = args.chat_id.clone();
-        let response = self
-            .read_on(&entry, move |archive| {
+        let response = step!(
+            self.read_on(&entry, move |archive| {
                 let before = before.as_ref().map(|(time, id)| (*time, id.as_str()));
                 super::page_messages(archive, &chat, before, limit)
             })
-            .await?;
+            .await
+        );
         Self::json_reply(
             serde_json::to_value(response).map_err(|error| internal(error.to_string()))?,
         )
@@ -191,16 +214,17 @@ impl ZapServer {
             ));
         }
         let limit = clamp_limit(args.limit, MESSAGES_DEFAULT_LIMIT, MESSAGES_LIMIT_MAX)?;
-        let entry = self.resolve(args.account_id.as_deref())?;
+        let entry = step!(self.resolve(args.account_id.as_deref()));
         let query = args.query.clone();
         let chat = args.chat_id.clone();
         let from = args.from;
         let until = args.until;
-        let response = self
-            .read_on(&entry, move |archive| {
+        let response = step!(
+            self.read_on(&entry, move |archive| {
                 super::search_messages(archive, &query, chat.as_deref(), from, until, limit)
             })
-            .await?;
+            .await
+        );
         Self::json_reply(
             serde_json::to_value(response).map_err(|error| internal(error.to_string()))?,
         )
@@ -213,7 +237,7 @@ impl ZapServer {
         &self,
         Parameters(args): Parameters<SendMessageArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let entry = self.resolve(args.account_id.as_deref())?;
+        let entry = step!(self.resolve(args.account_id.as_deref()));
         let chat = args.chat_id.clone();
         let quoting = args.quote_id.clone().map(ReplyTarget::from);
         let (reply, filed) = tokio::sync::oneshot::channel();
@@ -238,13 +262,14 @@ impl ZapServer {
         // server acks it; read there instead of asking the interface.
         let deadline = Instant::now() + SEND_ACK_WAIT;
         let status = loop {
-            let status = self
-                .read_on(&entry, {
+            let status = step!(
+                self.read_on(&entry, {
                     let chat = chat.clone();
                     let id = id.clone();
                     move |archive| Ok(archive.message(&chat, &id)?.map(|row| row.status))
                 })
-                .await?;
+                .await
+            );
             match status {
                 Some(status) if status != Delivery::Pending => break status,
                 _ if Instant::now() >= deadline => break Delivery::Pending,
@@ -352,5 +377,27 @@ impl ServerHandler for ZapServer {
              read here."
                 .to_string(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_account_is_a_tool_failure_not_a_protocol_error() {
+        let server = ZapServer::new(Arc::new(Hub::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let reply = runtime
+            .block_on(server.get_messages(Parameters(GetMessagesArgs {
+                account_id: Some("nope".to_owned()),
+                chat_id: "x".to_owned(),
+                limit: None,
+                before: None,
+            })))
+            .expect("a tool failure is an Ok result");
+        assert_eq!(reply.is_error, Some(true));
     }
 }
