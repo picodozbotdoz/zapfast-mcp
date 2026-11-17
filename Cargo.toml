@@ -215,6 +215,14 @@ fastframe-file = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
 fastframe-audio = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
 # Self-update from GitHub releases with signed checksums, a helper and rollback.
 fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1", features = ["reqwest"] }
+# The Model Context Protocol server this fork adds: the official Rust SDK,
+# serving tools over streamable HTTP on the loopback interface only. This is
+# zapfast-mcp's own addition, not an upstream ZapFast dependency.
+rmcp = { version = "3.10", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+# Serves the MCP transport, and carries the bearer-token check in front of it.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# JSON schema of the MCP tools' arguments, through rmcp's schemars feature.
+schemars = "1.0"
 
 [patch.crates-io]
 # crmne/egui apps-0.36.2, shared with Spotifast, RekordFlash and TonePush: egui

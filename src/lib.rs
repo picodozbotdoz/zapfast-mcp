@@ -33,6 +33,7 @@ pub mod lottie;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod markup;
+pub mod mcp;
 pub mod media_pause;
 pub mod mentions;
 pub mod model;

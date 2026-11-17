@@ -1174,6 +1174,45 @@ pub enum Command {
         prepared: Box<crate::updates::Prepared>,
         arguments: Vec<String>,
     },
+    /// MCP: sends composed text like `SendText`, and answers `reply` with the
+    /// filed message's id, or with why the send was refused. Nothing is
+    /// answered when the worker stops first.
+    McpSendText {
+        chat: ChatId,
+        text: String,
+        quoting: Option<crate::model::ReplyTarget>,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// MCP: answers `reply` with this account's identity and connection state.
+    McpAccountInfo {
+        reply: tokio::sync::oneshot::Sender<McpAccountState>,
+    },
+}
+
+/// What the MCP `list_accounts` tool says about one account. Fields stay
+/// plain: this crosses to the server thread, never to the interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpAccountState {
+    /// Our phone-number JID, once the link has said who we are.
+    pub jid: Option<String>,
+    /// Our profile name, once known.
+    pub name: Option<String>,
+    /// One word for [`LinkStatus`]: `starting`, `unlinked`, `connecting`,
+    /// `connected`, `disconnected`, `logged_out`, or `failed`.
+    pub status: &'static str,
+}
+
+/// One word for a link status, for surfaces that cannot carry the enum.
+pub fn link_status_word(status: &LinkStatus) -> &'static str {
+    match status {
+        LinkStatus::Starting => "starting",
+        LinkStatus::Unlinked { .. } => "unlinked",
+        LinkStatus::Connecting => "connecting",
+        LinkStatus::Connected => "connected",
+        LinkStatus::Disconnected { .. } => "disconnected",
+        LinkStatus::LoggedOut => "logged_out",
+        LinkStatus::Failed(_) => "failed",
+    }
 }
 
 #[derive(Debug)]
@@ -1894,6 +1933,13 @@ impl Backend {
             return;
         }
         let _ = self.commands.send(command);
+    }
+
+    /// A clonable handle to queue work from another thread, such as the MCP
+    /// server's tool calls. Commands sent here take the same path as the
+    /// interface's.
+    pub fn command_sender(&self) -> mpsc::UnboundedSender<Command> {
+        self.commands.clone()
     }
 
     /// Wake an offline demo when its local preview worker finishes.

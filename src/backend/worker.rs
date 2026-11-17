@@ -65,8 +65,8 @@ mod sticker_pace;
 mod stickers;
 
 use super::{
-    Command, Event, GroupEdit, LinkStatus, MessageRemovalOutcome, Refusal, SendTurn, Unsent, Waker,
-    read_sync::ReadSync,
+    Command, Event, GroupEdit, LinkStatus, McpAccountState, MessageRemovalOutcome, Refusal,
+    SendTurn, Unsent, Waker, read_sync::ReadSync,
 };
 use crate::app::PAGE;
 use crate::archive::Archive;
@@ -7150,6 +7150,7 @@ impl Worker {
     async fn handle_command(&mut self, command: Command) {
         let destination = match &command {
             Command::SendText { chat, .. }
+            | Command::McpSendText { chat, .. }
             | Command::ReplyInteractive { chat, .. }
             | Command::SendVoice { chat, .. }
             | Command::SendFiles { chat, .. }
@@ -7266,7 +7267,29 @@ impl Worker {
                 quoting,
                 mentions,
                 preview,
-            } => self.send_text(chat, text, quoting, mentions, preview),
+            } => {
+                let _ = self.send_text(chat, text, quoting, mentions, preview);
+            }
+            Command::McpSendText {
+                chat,
+                text,
+                quoting,
+                reply,
+            } => {
+                let result = match self.send_text(chat.clone(), text, quoting, Vec::new(), None) {
+                    Ok(Some(id)) => Ok(id),
+                    Ok(None) => Err("The message was not sent".to_owned()),
+                    Err(reason) => Err(reason),
+                };
+                let _ = reply.send(result);
+            }
+            Command::McpAccountInfo { reply } => {
+                let _ = reply.send(McpAccountState {
+                    jid: self.me_pn.clone(),
+                    name: self.me_name.clone(),
+                    status: crate::backend::link_status_word(&self.status),
+                });
+            }
             Command::FetchLinkPreview { url } => self.fetch_link_preview(url),
             Command::SendLocation {
                 chat,
@@ -9508,6 +9531,8 @@ impl Worker {
     }
 
     /// Dispatches composed text with its explicit quote target and restores it on refusal.
+    /// Returns the id of the message filed in the archive, or why nothing was
+    /// sent; the interface ignores it, and the MCP server answers with it.
     fn send_text(
         &mut self,
         chat: ChatId,
@@ -9515,18 +9540,18 @@ impl Worker {
         quoting: Option<crate::model::ReplyTarget>,
         mentions: Vec<String>,
         preview: Option<crate::model::ComposedPreview>,
-    ) {
+    ) -> Result<Option<String>, String> {
         let (context, shown) = match self.quote_target(&chat, quoting.as_ref()) {
             Ok(Some((context, shown))) => (Some(context), Some(shown)),
             Ok(None) => (None, None),
             Err(reason) => {
                 self.refuse(chat, quoting, Unsent::Text(text), reason);
-                return;
+                return Err(Self::refusal_reason(reason));
             }
         };
         let (Some(client), Some(jid)) = (self.connected_client(), Self::jid_of(&chat)) else {
             self.refuse(chat, quoting, Unsent::Text(text), Refusal::Offline);
-            return;
+            return Err(Self::refusal_reason(Refusal::Offline));
         };
         let mut mentions = mentions;
         if self.wants_mention_all(&chat, &text) {
@@ -9562,11 +9587,25 @@ impl Worker {
             self.commands.clone(),
             chat,
             jid,
-            id,
+            id.clone(),
             message,
             expiration,
             None,
         ));
+        Ok(Some(id))
+    }
+
+    /// A send refusal a caller may answer with, without leaking anything
+    /// about the chat or the text.
+    fn refusal_reason(reason: Refusal) -> String {
+        match reason {
+            Refusal::Blocked => "This contact is blocked".to_owned(),
+            Refusal::Offline => "ZapFast is not connected to WhatsApp".to_owned(),
+            Refusal::QuoteUnavailable => {
+                "The message being replied to is no longer available to quote".to_owned()
+            }
+            Refusal::UnsupportedViewOnce => "View-once media cannot be sent this way".to_owned(),
+        }
     }
 
     /// Builds the outgoing body, its stored content and thumbnail. A preview
@@ -27469,5 +27508,69 @@ mod lottie_sticker_tests {
             classify(&message),
             Some(Content::Sticker { media, animated: false }) if media.mime == "image/webp"
         ));
+    }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::receipt_tests::{PEER, worker};
+    use crate::backend::Command;
+
+    const ME: &str = "15550001111@s.whatsapp.net";
+
+    #[tokio::test]
+    async fn mcp_send_offline_answers_with_a_reason() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        worker
+            .handle_command(Command::McpSendText {
+                chat: PEER.to_owned(),
+                text: "hello".to_owned(),
+                quoting: None,
+                reply,
+            })
+            .await;
+        let reason = answer
+            .await
+            .expect("the worker always answers a send")
+            .expect_err("without a client the send is refused");
+        assert_eq!(reason, "ZapFast is not connected to WhatsApp");
+    }
+
+    #[tokio::test]
+    async fn mcp_send_blocked_answers_with_a_reason() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        worker.archive.ensure_chat(PEER, "Peer").unwrap();
+        worker.blocklist.ids = Some([PEER.to_owned()].into());
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        worker
+            .handle_command(Command::McpSendText {
+                chat: PEER.to_owned(),
+                text: "hello".to_owned(),
+                quoting: None,
+                reply,
+            })
+            .await;
+        assert_eq!(
+            answer
+                .await
+                .expect("the worker always answers a send")
+                .expect_err("a blocked contact is refused"),
+            "Unblock this contact to send messages."
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_account_info_answers_identity_and_status() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        worker
+            .handle_command(Command::McpAccountInfo { reply })
+            .await;
+        let state = answer.await.expect("the worker answers");
+        assert_eq!(state.jid.as_deref(), Some(ME));
+        assert_eq!(state.name, None);
+        assert_eq!(state.status, "connected");
     }
 }

@@ -215,6 +215,10 @@ impl Worker {
                 });
                 return;
             }
+            Command::McpSendText { reply, .. } => {
+                let _ = reply.send(Err("Unblock this contact to send messages.".into()));
+                return;
+            }
             _ => {
                 self.emit(Event::Error(
                     "Unblock this contact to send messages.".into(),

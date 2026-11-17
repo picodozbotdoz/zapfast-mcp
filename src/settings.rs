@@ -548,6 +548,11 @@ pub struct Settings {
     pub window_y: Option<f32>,
     /// Whether the window was maximized when it last closed.
     pub window_maximized: bool,
+    /// Serve the local MCP tools (for AI clients such as ZCode) while ZapFast
+    /// runs. A fork addition: upstream ZapFast has no scripting interface.
+    pub mcp_enabled: bool,
+    /// TCP port of the MCP server, on the loopback interface only.
+    pub mcp_port: u16,
 }
 
 impl Default for Settings {
@@ -605,6 +610,8 @@ impl Default for Settings {
             window_x: None,
             window_y: None,
             window_maximized: false,
+            mcp_enabled: false,
+            mcp_port: crate::mcp::DEFAULT_PORT,
         }
     }
 }

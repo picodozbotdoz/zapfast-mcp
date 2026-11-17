@@ -910,6 +910,10 @@ pub struct App {
     tray: Option<fastframe_tray::Tray>,
     /// Whether this run may have a tray item at all (`AppOptions::tray`).
     tray_allowed: bool,
+    /// The MCP server's account registry, when the MCP server runs this
+    /// session (`AppOptions::mcp`). Accounts are registered as they spawn and
+    /// unregistered when their backend stops.
+    pub mcp_hub: Option<std::sync::Arc<crate::mcp::Hub>>,
     /// The tray item could not be made while the setting wants one.
     tray_failed: bool,
     /// Dock clicks on macOS, which bring a closed window back with or without
@@ -1371,11 +1375,18 @@ fn tray_colour(panel_dark: Option<bool>) -> fastframe_tray::IconColour {
 pub struct AppOptions {
     /// Registers the system-tray item.
     pub tray: bool,
+    /// Runs the MCP server (this fork's addition) while ZapFast runs, on the
+    /// loopback interface at the given port. `None` runs nothing: the GUI
+    /// behaves exactly as before.
+    pub mcp: Option<crate::mcp::Options>,
 }
 
 impl Default for AppOptions {
     fn default() -> Self {
-        Self { tray: true }
+        Self {
+            tray: true,
+            mcp: None,
+        }
     }
 }
 
@@ -1431,6 +1442,20 @@ impl App {
         app.custom_themes
             .enable_desktop_themes(crate::theme::DESKTOP_THEMES);
         app.load_custom_themes();
+        // The MCP server (this fork's addition) serves every linked account
+        // through the same command channels the interface uses.
+        if let Some(mcp) = options.mcp {
+            let hub = std::sync::Arc::new(crate::mcp::Hub::new());
+            for account in &app.accounts {
+                hub.register(
+                    account.id.clone(),
+                    account.dirs.clone(),
+                    account.backend.command_sender(),
+                );
+            }
+            crate::mcp::host::spawn(app.dirs.clone(), hub.clone(), mcp);
+            app.mcp_hub = Some(hub);
+        }
         // Reading the desktop's font settings may wait on D-Bus; keep it off
         // the first frame.
         let text_waker = waker.clone();
@@ -1773,6 +1798,7 @@ impl App {
             waker,
             tray: None,
             tray_allowed: false,
+            mcp_hub: None,
             tray_failed: false,
             dock: None,
             tray_badge: 0,
@@ -2095,6 +2121,13 @@ impl App {
         account.backend.send(Command::SetKeepChatsArchived(
             self.settings.keep_chats_archived,
         ));
+        if let Some(hub) = &self.mcp_hub {
+            hub.register(
+                account.id.clone(),
+                account.dirs.clone(),
+                account.backend.command_sender(),
+            );
+        }
         self.account_before_adding = Some(self.account().id.clone());
         self.park_composer();
         self.clear_account_ui();
@@ -2154,6 +2187,9 @@ impl App {
             log::warn!("could not delete a removed account's archive key: {error:#}");
         }
         self.accounts.remove(index);
+        if let Some(hub) = &self.mcp_hub {
+            hub.unregister(&removed);
+        }
         if index < self.active {
             self.active -= 1;
         } else if self.active >= self.accounts.len() {

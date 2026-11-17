@@ -20,6 +20,16 @@ struct Cli {
     #[arg(long)]
     start_hidden: bool,
 
+    /// Serve MCP tools (this fork's addition) for AI clients such as ZCode
+    /// while ZapFast runs, on the loopback interface. The token the clients
+    /// answer with is kept in the state directory.
+    #[arg(long)]
+    mcp: bool,
+
+    /// TCP port for the MCP server (default 47190), on 127.0.0.1 only.
+    #[arg(long, value_name = "PORT")]
+    mcp_port: Option<u16>,
+
     /// Start with offline sample chats.
     #[cfg(feature = "demo")]
     #[arg(long)]
@@ -274,6 +284,12 @@ fn run() -> eframe::Result<()> {
                         "show its window"
                     }
                 );
+                if cli.mcp || cli.mcp_port.is_some() {
+                    eprintln!(
+                        "The running copy has no MCP server; quit it and start ZapFast again \
+                         with --mcp, or turn the MCP server on in its settings file"
+                    );
+                }
                 return Ok(());
             }
             single_instance::Outcome::Outdated => {
@@ -360,7 +376,12 @@ fn run() -> eframe::Result<()> {
     let mut app = if demo {
         app::App::headless(dirs, settings).0
     } else {
-        app::App::new(&waker, dirs, settings, app::AppOptions { tray: true })
+        // The MCP server runs when the settings file asks for it, or this
+        // launch did; the CLI port, when given, wins over the settings.
+        let mcp = (cli.mcp || settings.mcp_enabled).then_some(zapfast::mcp::Options {
+            port: cli.mcp_port.unwrap_or(settings.mcp_port),
+        });
+        app::App::new(&waker, dirs, settings, app::AppOptions { tray: true, mcp })
             .map_err(|error| eframe::Error::AppCreation(error.into()))?
     };
     if cli.verbose {
